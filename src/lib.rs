@@ -78,6 +78,8 @@ pub struct DebugMeta {
 
 #[async_trait]
 pub trait OSConfig: Sync + Send {
+    /// Optional maximum decompressed response size for enrollment requests.
+    fn get_http_response_limit(&self) -> Option<usize> { None }
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo;
     fn get_activation_device(&self) -> String;
     fn get_model_class(&self) -> String {

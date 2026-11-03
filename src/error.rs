@@ -88,6 +88,8 @@ pub enum PushError {
     ResourcePanic(String),
     #[error("Do not retry {0}")]
     DoNotRetry(Box<PushError>),
+    #[error("Response too large")]
+    ResponseTooLarge,
     #[error("Verification Failed")]
     VerificationFailed,
     #[error("Bag key not found")]

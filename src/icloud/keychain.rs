@@ -1,6 +1,7 @@
 use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, ops::Deref, sync::Arc, time::Duration};
 
 use aes_gcm::{AesGcm, Nonce};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::{Bottle, CloudKitRecord, CreateSubscriptionRequest, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, Identifier, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, Subscription, TlkShare, ViewKeys, Voucher, ot_bottle::OtAuthenticatedCiphertext, record::{Field, Reference, reference}, request_operation::header::{ContainerEnvironment, IsolationLevel}, response_operation, view_keys::ViewKey};
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
@@ -111,7 +112,46 @@ pub struct CuttlefishEncItem {
     encver: i64, // 2
 }
 
+impl CuttlefishCurrentItem {
+    /// The target record, if the server supplied its complete identifier.
+    pub fn target_record_identifier(&self) -> Option<&RecordIdentifier> {
+        let id = self.item.record_identifier.as_ref()?;
+        id.value.as_ref()?.name.as_ref().filter(|s| !s.is_empty())?;
+        id.zone_identifier.as_ref()?.value.as_ref()?.name.as_ref().filter(|s| !s.is_empty())?;
+        Some(id)
+    }
+}
+
 impl CuttlefishEncItem {
+    /// Decrypt one explicitly identified item using only caller-supplied recovered shares.
+    /// This does not touch the global keystore, perform I/O, or mutate cloud state.
+    pub fn decrypt_with_keys(&self, record: &Record, shares: &[CuttlefishSerializedKey]) -> Result<Dictionary, PushError> {
+        let invalid = || PushError::KeychainItemDecryptError("invalid targeted keychain item".into());
+        let id = record.record_identifier.as_ref().ok_or_else(invalid)?;
+        let uuid = id.value.as_ref().and_then(|x| x.name.as_deref()).filter(|x| !x.is_empty()).ok_or_else(invalid)?;
+        let zone = id.zone_identifier.as_ref().ok_or_else(invalid)?;
+        let zone_name = zone.value.as_ref().and_then(|x| x.name.as_deref()).filter(|x| !x.is_empty()).ok_or_else(invalid)?;
+        let parent = self.parentkeyref.record_identifier.as_ref().ok_or_else(invalid)?;
+        let parent_id = parent.value.as_ref().and_then(|x| x.name.as_deref()).filter(|x| !x.is_empty()).ok_or_else(invalid)?;
+        if parent.zone_identifier.as_ref() != Some(zone) || !matches!(self.encver, 1 | 2) { return Err(invalid()); }
+        let mut seen: HashMap<&str, (&str, &[u8])> = HashMap::new();
+        for share in shares.iter().filter(|s| s.zone_name.as_deref() == Some(zone_name)) {
+            let name = share.uuid.as_deref().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+            let class = share.keyclass.as_deref().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+            let key = share.key.as_deref().filter(|k| k.len() == 64).ok_or_else(invalid)?;
+            if let Some(previous) = seen.insert(name, (class, key)) { if previous != (class, key) { return Err(invalid()); } }
+        }
+        let (_, key) = seen.get(parent_id).ok_or_else(invalid)?;
+        let wrapped = STANDARD.decode(&self.wrappedkey).map_err(|_| invalid())?;
+        let mut cipher = CmacSiv::<Aes256>::new_from_slice(key).map_err(|_| invalid())?;
+        let record_key = cipher.decrypt::<&[&[u8]; 0], &&[u8]>(&[], &wrapped[..]).map_err(|_| invalid())?;
+        if self.encver == 2 && record.record_field.iter().any(|f| {
+            f.identifier.as_ref().and_then(|i| i.name.as_ref()).is_none() || f.value.is_none() ||
+            f.value.as_ref().and_then(|v| v.date_value.as_ref()).map(|d| { let t = d.time(); !t.is_finite() || chrono::DateTime::from_timestamp(t.trunc() as i64, (t.fract() * 1e9) as u32).is_none() }).unwrap_or(false)
+        }) { return Err(invalid()); }
+        self.decrypt_with_record_key(uuid, record, &record_key)
+    }
+
     fn authenticated_data_v2(&self, uuid: &str, fields: &[Field]) -> BTreeMap<String, Vec<u8>> {
         debug!("Building AAD v2 for keychain item {uuid}");
         let mut aad = BTreeMap::from_iter([
@@ -215,7 +255,11 @@ impl CuttlefishEncItem {
         let item = keystore.get_key_id(self.parent_key_id()).ok_or(PushError::DecryptionKeyNotFound(self.parent_key_id().to_string()))?;
         let result = item.decrypt(&keystore_key, &base64_decode(&self.wrappedkey));
 
-        let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).map_err(|_| {
+        self.decrypt_with_record_key(uuid, record, &result)
+    }
+
+    fn decrypt_with_record_key(&self, uuid: &str, record: &Record, result: &[u8]) -> Result<Dictionary, PushError> {
+        let mut cipher = CmacSiv::<Aes256>::new_from_slice(result).map_err(|_| {
             PushError::KeychainItemDecryptError(format!(
                 "item {uuid} has an invalid {}-byte record key",
                 result.len()
@@ -2268,11 +2312,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             .body(plist_to_string(&request)?)
             .send().await?; 
 
-        if !resp.status().is_success() {
-            return Err(PushError::EscrowError(plist::from_bytes(&resp.bytes().await?)?))
-        }
-
-        Ok(plist::from_bytes(&resp.bytes().await?)?)
+        let success = resp.status().is_success();
+        let body = crate::util::read_bounded_response(resp, self.config.get_http_response_limit()).await?;
+        if !success { return Err(PushError::EscrowError(plist::from_bytes(&body)?)); }
+        Ok(plist::from_bytes(&body)?)
     }
 
     pub async fn enroll(&self, password: &[u8], label: &str, mid: &str, formatted_time: &str, bottle_id: String, escrowed_signing_key: Vec<u8>, record: &[u8]) -> Result<(), PushError> {
@@ -2472,5 +2515,39 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let dec = decrypt(Cipher::aes_128_cbc(), &derived_key, Some(&payloads[1][..16]), &payloads[3])?;
 
         Ok(dec)
+    }
+}
+
+#[cfg(test)]
+mod targeted_read_tests {
+    use super::*;
+
+    fn id(name: &str, zone: &str) -> RecordIdentifier {
+        RecordIdentifier { value: Some(Identifier { name: Some(name.into()), ..Default::default() }), zone_identifier: Some(RecordZoneIdentifier { value: Some(Identifier { name: Some(zone.into()), ..Default::default() }), ..Default::default() }) }
+    }
+
+    #[test]
+    fn target_and_decrypt_with_only_matching_recovered_key() {
+        let parent = id("key-1", "Manatee");
+        let current = CuttlefishCurrentItem { item: Reference { record_identifier: Some(id("item-1", "Manatee")), ..Default::default() } };
+        assert_eq!(current.target_record_identifier(), Some(&id("item-1", "Manatee")));
+        assert!(CuttlefishCurrentItem::default().target_record_identifier().is_none());
+        let key = SivKey(vec![42; 64]);
+        let mut item = CuttlefishEncItem { encver: 2, parentkeyref: Reference { record_identifier: Some(parent), ..Default::default() }, ..Default::default() };
+        let expected = Dictionary::from_iter([("value".to_string(), Value::String("fixture".into()))]);
+        item.encrypt("item-1", &key, expected.clone()).unwrap();
+        let record = Record { record_identifier: Some(id("item-1", "Manatee")), ..Default::default() };
+        let share = CuttlefishSerializedKey { uuid: Some("key-1".into()), zone_name: Some("Manatee".into()), keyclass: Some("classC".into()), key: Some(key.0.clone()) };
+        assert_eq!(item.decrypt_with_keys(&record, &[share.clone()]).unwrap(), expected);
+        assert!(item.decrypt_with_keys(&record, &[]).is_err());
+        let mut wrong = share.clone(); wrong.zone_name = Some("Other".into());
+        assert!(item.decrypt_with_keys(&record, &[wrong]).is_err());
+        let mut wrong = share.clone(); wrong.key = Some(vec![43; 64]);
+        assert!(item.decrypt_with_keys(&record, &[wrong.clone()]).is_err());
+        assert!(item.decrypt_with_keys(&record, &[share.clone(), wrong]).is_err());
+        let mut changed = item.clone(); changed.data[20] ^= 1;
+        assert!(changed.decrypt_with_keys(&record, &[share.clone()]).is_err());
+        let wrong_record = Record { record_identifier: Some(id("item-1", "Other")), ..Default::default() };
+        assert!(item.decrypt_with_keys(&wrong_record, &[share]).is_err());
     }
 }

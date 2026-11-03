@@ -162,6 +162,39 @@ pub enum PCSPrivateKey {
 }
 
 impl PCSPrivateKey {
+    /// Decode a plaintext PCS snapshot and require a valid existing signature chain.
+    /// Callers must contain malformed upstream decoder panics in a disposable process.
+    pub fn from_existing_plaintext(dict: &Dictionary, state: &KeychainClientState) -> Result<Self, PushError> {
+        fn decode(dict: &Dictionary) -> Result<(PCSPrivateKey, Vec<u8>), PushError> {
+            let raw = dict.get("v_Data").and_then(Value::as_data).ok_or(PushError::MasterKeyNotFound)?;
+            let id = dict.get("atyp").and_then(Value::as_data).ok_or(PushError::MasterKeyNotFound)?;
+            let key: PCSPrivateKey = rasn::der::decode(raw).map_err(|_| PushError::VerificationFailed)?;
+            let public = key.public()?;
+            if public.signature.is_none() || id != &sha256(&public.pub_key)[..20] || key.key().compress().as_slice() != public.pub_key.as_ref() { return Err(PushError::VerificationFailed); }
+            Ok((key, id.to_vec()))
+        }
+        let (original, original_id) = decode(dict)?;
+        let mut key = original.clone();
+        let mut id = original_id;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(id.clone()) || visited.len() > 128 { return Err(PushError::VerificationFailed); }
+            let public = key.public()?;
+            let signature = public.signature.as_ref().ok_or(PushError::VerificationFailed)?;
+            let signer_id = signature.keyid.to_vec();
+            if signer_id == id {
+                if public.pcsservice != 1 || !public.verify(&key.signing_key())? { return Err(PushError::VerificationFailed); }
+                return Ok(original);
+            }
+            let masters = state.items.get("ProtectedCloudStorage").ok_or(PushError::MasterKeyNotFound)?;
+            let matches: Vec<_> = masters.keys.values().filter(|item| item.get("atyp").and_then(Value::as_data) == Some(signer_id.as_slice())).collect();
+            if matches.len() != 1 { return Err(PushError::MasterKeyNotFound); }
+            let (parent, parent_id) = decode(matches[0])?;
+            if !public.verify(&parent.signing_key())? { return Err(PushError::VerificationFailed); }
+            key = parent;
+            id = parent_id;
+        }
+    }
     pub fn new(signature_key: Option<&PCSPrivateKey>, service: i64, v2: bool, attributes: Vec<PCSAttribute>) -> Result<Self, PushError> {
         let key = CompactECKey::new()?;
         let signing_key = CompactECKey::new()?;
@@ -705,6 +738,28 @@ impl PCSShareProtection {
         Ok(PCSPrivateKey::from_dict(item, keychain))
     }
 
+    /// Require a signature verified by one of the supplied trusted private keys.
+    pub fn decode_trusted(&self, keys: &[impl Borrow<CompactECKey<Private>>]) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+        if self.signature.is_none() { return Err(PushError::VerificationFailed); }
+        self.decode(keys, None::<&CompactECKey<Public>>)
+    }
+
+    /// Select and verify an existing plaintext PCS key; never syncs or creates one.
+    pub fn decrypt_with_existing(&self, state: &KeychainClientState, service: &PCSService<'_>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+        let masters = state.items.get("ProtectedCloudStorage").ok_or(PushError::MasterKeyNotFound)?;
+        let service_items = state.items.get(service.zone).ok_or(PushError::MasterKeyNotFound)?;
+        for item in masters.keys.values().chain(service_items.keys.values()) {
+            if item.get("v_Data").and_then(Value::as_data).is_none() || item.get("atyp").and_then(Value::as_data).is_none() { return Err(PushError::MasterKeyNotFound); }
+            PCSPrivateKey::from_existing_plaintext(item, state)?;
+        }
+        let candidates = self.get_encryption_keys().iter().map(|k| Value::String(base64_encode(k))).collect::<Vec<_>>();
+        let matches = service_items.keys.values().filter(|item| item.get("acct").map(|a| candidates.contains(a)).unwrap_or(false)).collect::<Vec<_>>();
+        if matches.len() != 1 { return Err(PushError::MasterKeyNotFound); }
+        let decoded = PCSPrivateKey::from_existing_plaintext(matches[0], state)?;
+        if decoded.public()?.pcsservice != service.r#type { return Err(PushError::VerificationFailed); }
+        self.decode_trusted(&[&decoded.key()])
+    }
+
     pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>, custom_signing: bool) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         let decoded = self.get_private_key(keychain, service)?;
         
@@ -1026,4 +1081,55 @@ pub struct PCSObjectSignature {
     ec_key_list: Option<SequenceOf<PCSKeyRef>>,
     #[rasn(tag(explicit(context, 3)))]
     attributes: Option<SequenceOf<PCSAttribute>>,
+}
+
+#[cfg(test)]
+mod existing_plaintext_tests {
+    use super::*;
+    use crate::keychain::SavedKeychainZone;
+    fn entry(key: &PCSPrivateKey) -> Dictionary {
+        let public = key.public().unwrap();
+        Dictionary::from_iter([
+            ("v_Data".to_string(), Value::Data(rasn::der::encode(key).unwrap())),
+            ("atyp".to_string(), Value::Data(sha256(&public.pub_key)[..20].to_vec())),
+        ])
+    }
+    #[test]
+    fn strict_existing_signature_requires_master_and_rejects_tampering() {
+        let master_key = CompactECKey::new().unwrap();
+        let mut public = PCSPublicKey { pcsservice: 1, unk1: 1, pub_key: master_key.compress().to_vec().into(), attributes: None, signature: None };
+        public.sign(&master_key).unwrap();
+        let master = PCSPrivateKey::V1 { key: master_key.compress_private().to_vec().into(), public: Some(public) };
+        let service = PCSPrivateKey::new(Some(&master), 82, false, vec![]).unwrap();
+        let master_entry = entry(&master);
+        let service_entry = entry(&service);
+        let mut state = KeychainClientState::new_with_host("fixture".into(), "fixture".into(), "fixture".into());
+        assert!(PCSPrivateKey::from_existing_plaintext(&service_entry, &state).is_err());
+        let mut zone = SavedKeychainZone::default();
+        zone.keys.insert("master".into(), master_entry);
+        state.items.insert("ProtectedCloudStorage".into(), zone);
+        PCSPrivateKey::from_existing_plaintext(&service_entry, &state).expect("valid signed fixture");
+        let zone_key = CompactECKey::new().unwrap();
+        let protection = PCSShareProtection::create_new(&service.key(), &[zone_key.clone()], &[service.key()], false).unwrap();
+        let mut service_item = service_entry.clone();
+        service_item.insert("acct".into(), Value::String(base64_encode(&service.public().unwrap().pub_key)));
+        let mut service_zone = SavedKeychainZone::default();
+        service_zone.keys.insert("service".into(), service_item);
+        state.items.insert("Manatee".into(), service_zone);
+        let cloud_zone = cloudkit_proto::Zone { zone_identifier: Some(cloudkit_proto::RecordZoneIdentifier { value: Some(cloudkit_proto::Identifier { name: Some("BeaconStore".into()), ..Default::default() }), ..Default::default() }), protection_info: Some(protection.to_protection_info(true).unwrap()), ..Default::default() };
+        let strict_zone = crate::cloudkit::PCSZoneConfig::from_existing_private_zone(&cloud_zone, &state, &crate::findmy::FIND_MY_SERVICE).unwrap();
+        let unsigned = PCSShareProtection::create(&service.key(), &[zone_key.clone()], &[] as &[CompactECKey<Private>], PCSKey::random(), None, &[], None, 1, None, false).unwrap();
+        let mut bad_zone = cloud_zone.clone();
+        bad_zone.protection_info = Some(unsigned.to_protection_info(true).unwrap());
+        assert!(matches!(crate::cloudkit::PCSZoneConfig::from_existing_private_zone(&bad_zone, &state, &crate::findmy::FIND_MY_SERVICE), Err(PushError::VerificationFailed)));
+        let unsigned_record = PCSShareProtection::create(&zone_key, &[], &[] as &[CompactECKey<Private>], PCSKey::random(), None, &[], None, 1, None, false).unwrap();
+        let mut bad_default = cloud_zone.clone();
+        bad_default.record_protection_info = Some(unsigned_record.to_protection_info(true).unwrap());
+        assert!(matches!(crate::cloudkit::PCSZoneConfig::from_existing_private_zone(&bad_default, &state, &crate::findmy::FIND_MY_SERVICE), Err(PushError::VerificationFailed)));
+        let record = cloudkit_proto::Record { record_identifier: Some(cloudkit_proto::RecordIdentifier { value: Some(cloudkit_proto::Identifier { name: Some("synthetic".into()), ..Default::default() }), zone_identifier: cloud_zone.zone_identifier.clone() }), protection_info: Some(unsigned_record.to_protection_info(true).unwrap()), ..Default::default() };
+        assert!(matches!(crate::cloudkit::pcs_keys_for_record(&record, &strict_zone), Err(PushError::VerificationFailed)));
+        let mut changed = service.clone();
+        if let PCSPrivateKey::V1 { public: Some(ref mut p), .. } = changed { let signature = &mut p.signature.as_mut().unwrap().signature; let mut bytes = signature.to_vec(); bytes[0] ^= 1; *signature = bytes.into(); } else { panic!("unexpected fixture"); }
+        assert!(PCSPrivateKey::from_existing_plaintext(&entry(&changed), &state).is_err());
+    }
 }

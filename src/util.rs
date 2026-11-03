@@ -2715,3 +2715,83 @@ pub trait BinaryReadExt: Read {
 }
 
 impl<R: Read + ?Sized> BinaryReadExt for R {}
+
+/// Read an HTTP body with an optional cap on both advertised and decoded bytes.
+pub async fn read_bounded_response(response: reqwest::Response, limit: Option<usize>) -> Result<Vec<u8>, PushError> {
+    if let Some(max) = limit {
+        check_advertised_length(response.content_length(), max)?;
+        check_advertised_length(response.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()), max)?;
+        collect_bounded_chunks(response.bytes_stream(), max).await
+    } else {
+        Ok(response.bytes().await?.to_vec())
+    }
+}
+
+async fn collect_bounded_chunks<S>(stream: S, max: usize) -> Result<Vec<u8>, PushError>
+where S: futures::Stream<Item = Result<prost::bytes::Bytes, reqwest::Error>> {
+    use futures::StreamExt;
+    futures::pin_mut!(stream);
+    let mut data = Vec::new();
+    while let Some(chunk) = stream.next().await { append_bounded(&mut data, &chunk?, max)?; }
+    Ok(data)
+}
+
+fn check_advertised_length(length: Option<u64>, max: usize) -> Result<(), PushError> {
+    if length.map(|n| n > max as u64).unwrap_or(false) { return Err(PushError::ResponseTooLarge); }
+    Ok(())
+}
+
+fn append_bounded(data: &mut Vec<u8>, chunk: &[u8], max: usize) -> Result<(), PushError> {
+    if chunk.len() > max.saturating_sub(data.len()) { return Err(PushError::ResponseTooLarge); }
+    data.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(test)]
+mod bounded_response_tests {
+    use super::*;
+    #[tokio::test]
+    async fn streamed_chunks_never_append_past_limit() {
+        use prost::bytes::Bytes;
+        let chunks = futures::stream::iter(vec![Ok(Bytes::from_static(b"abc")), Ok(Bytes::from_static(b"de"))]);
+        assert!(matches!(collect_bounded_chunks(chunks, 4).await, Err(PushError::ResponseTooLarge)));
+        assert!(matches!(check_advertised_length(Some(5), 4), Err(PushError::ResponseTooLarge)));
+        assert!(check_advertised_length(None, 4).is_ok());
+        assert!(check_advertised_length(Some(4), 4).is_ok());
+        let mut data = Vec::new();
+        append_bounded(&mut data, b"abc", 4).unwrap();
+        assert!(matches!(append_bounded(&mut data, b"de", 4), Err(PushError::ResponseTooLarge)));
+        assert_eq!(data, b"abc");
+    }
+    #[tokio::test]
+    async fn http_content_length_and_chunked_reads_are_limited_before_decode() {
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::{timeout, Duration}};
+        async fn fetch(wire: Vec<u8>) -> reqwest::Response {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                socket.write_all(&wire).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let response = timeout(Duration::from_secs(3), reqwest::Client::builder().no_proxy().build().unwrap()
+                .get(format!("http://{address}/fixture")).send()).await.unwrap().unwrap();
+            timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+            response
+        }
+        let fixed = fetch(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde".to_vec()).await;
+        assert!(matches!(read_bounded_response(fixed, Some(4)).await, Err(PushError::ResponseTooLarge)));
+        let chunked = fetch(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n".to_vec()).await;
+        assert!(matches!(read_bounded_response(chunked, Some(4)).await, Err(PushError::ResponseTooLarge)));
+        let compressed = gzip_normal(&vec![b'x'; 4096]).unwrap();
+        assert!(compressed.len() < 256);
+        let mut wire = format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", compressed.len()).into_bytes();
+        wire.extend_from_slice(&compressed);
+        assert!(matches!(read_bounded_response(fetch(wire).await, Some(256)).await, Err(PushError::ResponseTooLarge)));
+        let valid = fetch(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".to_vec()).await;
+        assert_eq!(read_bounded_response(valid, Some(4)).await.unwrap(), b"abc");
+    }
+
+}

@@ -20,7 +20,7 @@ use aes_gcm::KeyInit;
 use cloudkit_proto::CloudKitEncryptor;
 use crate::{APSConnection, APSMessage, aps::APSInterestToken, util::{DebugMutex, DebugRwLock, bin_deserialize, bin_serialize, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt}};
 
-use crate::{FileContainer, OSConfig, PushError, auth::{MobileMeDelegateResponse, TokenProvider}, keychain::KeychainClient, mmcs::{AuthorizedOperation, MMCSConfig, PreparedPut, get_headers, get_mmcs, put_authorize_body, put_mmcs}, mmcsp::FordChunk, pcs::{PCSEncryptor, PCSKey, PCSKeyRef, PCSPrivateKey, PCSService, PCSShareProtection, ParticipantMeta}, prepare_put, util::{CompactECKey, REQWEST, base64_decode, base64_encode, base64_encode_url, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key}};
+use crate::{FileContainer, OSConfig, PushError, auth::{MobileMeDelegateResponse, TokenProvider}, keychain::{KeychainClient, KeychainClientState}, mmcs::{AuthorizedOperation, MMCSConfig, PreparedPut, get_headers, get_mmcs, put_authorize_body, put_mmcs}, mmcsp::FordChunk, pcs::{PCSEncryptor, PCSKey, PCSKeyRef, PCSPrivateKey, PCSService, PCSShareProtection, ParticipantMeta}, prepare_put, util::{CompactECKey, REQWEST, base64_decode, base64_encode, base64_encode_url, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key}};
 
 fn undelimit_response(resp: &mut impl Read) -> Vec<Vec<u8>> {
     let mut response: Vec<Vec<u8>> = vec![];
@@ -30,6 +30,28 @@ fn undelimit_response(resp: &mut impl Read) -> Vec<Vec<u8>> {
         response.push(data);
     }
     response
+}
+
+/// Decode bounded length-delimited CloudKit frames without allocating declared oversized frames.
+fn undelimit_response_bounded(data: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, PushError> {
+    let mut result = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        if result.len() >= 4096 { return Err(PushError::ResponseTooLarge); }
+        let mut size = 0u64;
+        let mut terminated = false;
+        for shift in (0..70).step_by(7) {
+            let byte = *data.get(pos).ok_or(PushError::VerificationFailed)?; pos += 1;
+            if shift == 63 && byte > 1 { return Err(PushError::ResponseTooLarge); }
+            size |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 { terminated = true; break; }
+        }
+        if !terminated || size > limit as u64 { return Err(PushError::ResponseTooLarge); }
+        let size = usize::try_from(size).map_err(|_| PushError::ResponseTooLarge)?;
+        let end = pos.checked_add(size).filter(|end| *end <= data.len()).ok_or(PushError::VerificationFailed)?;
+        result.push(data[pos..end].to_vec()); pos = end;
+    }
+    Ok(result)
 }
 
 pub fn contact_info_to_handle(info: &ContactInformation) -> Option<String> {
@@ -1327,7 +1349,8 @@ impl<'t> CloudKitContainer<'t> {
             client.token_provider.refresh_mme().await?;
         }
 
-        let response: CkInitResponse = response.json().await?;
+        let bytes = crate::util::read_bounded_response(response, client.config.get_http_response_limit()).await?;
+        let response: CkInitResponse = serde_json::from_slice(&bytes)?;
 
         drop(state);
 
@@ -1349,6 +1372,7 @@ pub struct QueryResult<T: CloudKitRecord> {
 #[derive(Clone)]
 pub struct PCSZoneConfig {
     identifier: RecordZoneIdentifier,
+    strict_existing: bool,
     zone_keys: Vec<CompactECKey<Private>>,
     zone_protection_tag: Option<String>,
     default_record_keys: Vec<PCSKey>,
@@ -1359,9 +1383,28 @@ pub struct PCSZoneConfig {
 }
 
 impl PCSZoneConfig {
+    /// Construct from an already-fetched private zone and plaintext keychain snapshot.
+    /// Never performs network, global-keystore, sync, creation or save operations.
+    pub fn from_existing_private_zone(zone: &Zone, state: &KeychainClientState, service: &PCSService<'_>) -> Result<Self, PushError> {
+        let id = zone.zone_identifier.clone().ok_or(PushError::VerificationFailed)?;
+        if id.value.as_ref().and_then(|v| v.name.as_ref()).filter(|s| !s.is_empty()).is_none() { return Err(PushError::VerificationFailed); }
+        let info = zone.protection_info.as_ref().filter(|p| p.protection_info.as_ref().map(|b| !b.is_empty()).unwrap_or(false)).ok_or(PushError::VerificationFailed)?;
+        let protection = PCSShareProtection::from_protection_info(info);
+        let (parent_keys, zone_keys) = protection.decrypt_with_existing(state, service)?;
+        let mut result = Self { identifier: id, strict_existing: true, zone_keys, zone_protection_tag: info.protection_info_tag.clone(), default_record_keys: vec![], record_prot_tag: None, zone_pcs_key: parent_keys, zone_roll_count: protection.get_roll_count(), record_roll_count: 1 };
+        if let Some(record_info) = &zone.record_protection_info {
+            if record_info.protection_info.as_ref().map(|b| b.is_empty()).unwrap_or(true) { return Err(PushError::VerificationFailed); }
+            let record_protection = PCSShareProtection::from_protection_info(record_info);
+            let (keys, _) = record_protection.decode_trusted(&result.zone_keys)?;
+            result.record_prot_tag = record_info.protection_info_tag.clone();
+            result.record_roll_count = record_protection.get_roll_count();
+            result.default_record_keys = keys;
+        }
+        Ok(result)
+    }
     fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<Vec<PCSKey>, PushError> {
         let record_protection = PCSShareProtection::from_protection_info(protection);
-        let (key, _record_keys) = record_protection.decode(&self.zone_keys, None::<&CompactECKey<Public>>).unwrap();
+        let (key, _record_keys) = if self.strict_existing { record_protection.decode_trusted(&self.zone_keys)? } else { record_protection.decode(&self.zone_keys, None::<&CompactECKey<Public>>)? };
 
         Ok(key)
     }
@@ -1526,6 +1569,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     };
 
                     let mut keys = PCSZoneConfig {
+                        strict_existing: false,
                         identifier: zone_id.clone(),
                         zone_keys: keys,
                         zone_protection_tag: zone.protection_info.as_ref().unwrap().protection_info_tag.clone(),
@@ -2043,11 +2087,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             return Err(PushError::TooManyRequests);
         }
         
-        let token: Vec<u8> = response.bytes().await?
-            .into();
-        let mut cursor = Cursor::new(token);
-
-        let undelimited = undelimit_response(&mut cursor);
+        let limit = self.client.config.get_http_response_limit();
+        let token = crate::util::read_bounded_response(response, limit).await?;
+        let undelimited = if let Some(max) = limit { undelimit_response_bounded(&token, max)? } else { undelimit_response(&mut Cursor::new(token)) };
         let response = undelimited.into_iter().map(|u| Ok(ResponseOperation::decode(&mut Cursor::new(u))?)).collect::<Result<Vec<ResponseOperation>, PushError>>()?;
 
         let mut responses = vec![];
@@ -2172,3 +2214,26 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
 
 
+
+#[cfg(test)]
+mod existing_zone_tests {
+    use super::*;
+    #[test]
+    fn missing_zone_material_fails_without_creation() {
+        let state = KeychainClientState::new_with_host("fixture".into(), "fixture".into(), "fixture".into());
+        let service = crate::findmy::FIND_MY_SERVICE;
+        assert!(PCSZoneConfig::from_existing_private_zone(&Zone::default(), &state, &service).is_err());
+        assert!(state.items.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bounded_frame_tests {
+    use super::*;
+    #[test]
+    fn rejects_oversized_declared_frame_and_excessive_empty_frames() {
+        assert!(matches!(undelimit_response_bounded(&[0x80, 0x80, 0x80, 0x04], 16), Err(PushError::ResponseTooLarge)));
+        assert!(matches!(undelimit_response_bounded(&vec![0; 4097], 8192), Err(PushError::ResponseTooLarge)));
+        assert!(matches!(undelimit_response_bounded(&[4, 1], 16), Err(PushError::VerificationFailed)));
+    }
+}

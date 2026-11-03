@@ -1089,6 +1089,7 @@ async fn replay_send(
     Ok(())
 }
 
+#[cfg(feature = "activation")]
 #[tokio::test]
 async fn proxy() {
     if let Err(_) = std::env::var("RUST_LOG") {

@@ -7,7 +7,8 @@ edition = "2021"
 remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
 remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
 macos-validation-data = ["dep:open-absinthe"]
-default = ["macos-validation-data"]
+activation = []
+default = ["macos-validation-data", "activation"]
 
 [dependencies]
 plist = "1.7.0"

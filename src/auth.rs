@@ -417,9 +417,8 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     }
 
     let resp = req.send().await?;
-    let text = resp.text().await?;
-
-    let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
+    let body = crate::util::read_bounded_response(resp, os_config.get_http_response_limit()).await?;
+    let parsed = plist::Value::from_reader(Cursor::new(body))?;
     let parsed_dict = parsed.as_dictionary().unwrap();
 
     if let Some(error) = parsed_dict.get("localizedError") {
